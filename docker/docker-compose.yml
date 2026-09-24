@@ -1,0 +1,10 @@
+services:
+  camera_pipeline:
+    image: rosyolo
+    container_name: camera_pipeline
+    network_mode: host
+    ipc: host
+    environment:
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+    command: bash -c "source /opt/ros/humble/setup.bash && source install/setup.bash && ros2 launch camera_pipeline camera_pipeline.launch.py"
