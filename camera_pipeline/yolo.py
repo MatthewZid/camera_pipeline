@@ -16,6 +16,8 @@ from rclpy.duration import Duration
 from tf2_geometry_msgs import do_transform_point
 from geometry_msgs.msg import PointStamped
 import time
+from phd_msgs.msg import WorldObject, WorldObjectArray, VisualObservation, VisualObservationArray
+from sensor_msgs.msg import CompressedImage
 
 class CameraSub(Node):
 
@@ -26,6 +28,20 @@ class CameraSub(Node):
             history=HistoryPolicy.KEEP_LAST,
             depth=5,
             reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+        )
+
+        world_object_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+
+        obs_profile = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.VOLATILE,
         )
 
@@ -49,6 +65,9 @@ class CameraSub(Node):
 
         self.synchronizer = ApproximateTimeSynchronizer([self.color_sub, self.depth_sub], queue_size=10, slop=0.08)
         self.synchronizer.registerCallback(self.synced_callback)
+
+        self.world_objects_pub = self.create_publisher(WorldObjectArray, "/world_objects", world_object_profile)
+        self.object_observations_pub = self.create_publisher(VisualObservationArray, "/object_observations", obs_profile)
 
         self.bridge = CvBridge()
         self.model = YOLO("/models/yolo11n-seg.pt")
@@ -85,7 +104,7 @@ class CameraSub(Node):
         self.maximum_prediction_time_s = 1.0
 
         # Global one-to-one association parameters.
-        self.dynamic_reidentification_age_s = 10.0
+        self.dynamic_reidentification_age_s = 30.0
         self.dynamic_active_age_s = 2.0
         # Static objects remain available for later SST queries in the map.
         self.static_active_age_s = float("inf")
@@ -179,24 +198,18 @@ class CameraSub(Node):
         timestamp_ns = int(depth_msg.header.stamp.sec) * 1_000_000_000 + int(depth_msg.header.stamp.nanosec)
 
         if results is None or len(results) == 0:
-            self.current_objects = {}
-            with self.world_objects_lock:
-                self.mark_stale_world_objects(timestamp_ns)
+            self.publish_empty_observation_frame(depth_msg=depth_msg, timestamp_ns=timestamp_ns)
             return
 
         result = results[0]
 
         if result.boxes is None or len(result.boxes) == 0:
-            self.current_objects = {}
-            with self.world_objects_lock:
-                self.mark_stale_world_objects(timestamp_ns)
+            self.publish_empty_observation_frame(depth_msg=depth_msg, timestamp_ns=timestamp_ns)
             return
 
         if result.masks is None:
             self.get_logger().warning("YOLO returned boxes but no masks")
-            self.current_objects = {}
-            with self.world_objects_lock:
-                self.mark_stale_world_objects(timestamp_ns)
+            self.publish_empty_observation_frame(depth_msg=depth_msg, timestamp_ns=timestamp_ns)
             return
 
         camera_frame = depth_msg.header.frame_id
@@ -224,6 +237,10 @@ class CameraSub(Node):
         missing_masks = 0
         invalid_geometry = 0
         transform_failures = 0
+
+        obs_array_msg = VisualObservationArray()
+        obs_array_msg.header.stamp = depth_msg.header.stamp
+        obs_array_msg.header.frame_id = depth_msg.header.frame_id
 
         for index, box in enumerate(result.boxes):
             # A tracking ID might not yet be available for an
@@ -267,7 +284,6 @@ class CameraSub(Node):
                 "label": label,
                 "class_id": class_id,
                 "confidence": confidence,
-
                 "bbox_xyxy": [xmin, ymin, xmax, ymax],
 
                 # Boolean NumPy array or None.
@@ -291,14 +307,46 @@ class CameraSub(Node):
             }
 
             frame_observations.append(observation)
+            obs_msg = VisualObservation()
+
+            if track_id is None:
+                obs_msg.has_track_id = False
+                obs_msg.track_id = -1
+            else:
+                obs_msg.has_track_id = True
+                obs_msg.track_id = int(track_id)
+
+            obs_msg.label = str(label)
+            obs_msg.class_id = int(class_id)
+            obs_msg.confidence = float(confidence)
+            obs_msg.bbox_xyxy = [xmin, ymin, xmax, ymax]
+            obs_msg.image_width = int(image.shape[1])
+            obs_msg.image_height = int(image.shape[0])
+
+            if crop is not None and crop.size > 0:
+                encoding_successful, encoded_crop = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
+
+                if encoding_successful:
+                    crop_message = CompressedImage()
+                    crop_message.header.stamp = depth_msg.header.stamp
+                    crop_message.header.frame_id = depth_msg.header.frame_id
+                    crop_message.format = "jpeg"
+                    crop_message.data = encoded_crop.tobytes()
+
+                    obs_msg.crop = crop_message
+                else:
+                    self.get_logger().warning(f"Could not JPEG-encode crop for {label} track {track_id}")
+
+            obs_array_msg.observations.append(obs_msg)
 
         # Associate the complete frame in one operation. This guarantees that
         # two detections cannot update the same persistent world object.
         with self.world_objects_lock:
             world_object_ids = self.update_world_objects_for_frame(frame_observations, timestamp_ns)
 
-            for observation, world_object_id in zip(frame_observations, world_object_ids):
+            for observation, observation_msg, world_object_id in zip(frame_observations, obs_array_msg.observations, world_object_ids):
                 observation["world_object_id"] = world_object_id
+                observation_msg.world_object_id = int(world_object_id)
                 track_id = observation["track_id"]
                 index = observation["detection_index"]
 
@@ -315,8 +363,7 @@ class CameraSub(Node):
                     f"position_odom={world_object['position_odom']}, "
                     f"velocity_odom={world_object['velocity_odom']}, "
                     f"radius={world_object['radius_m']:.3f} m, "
-                    f"uncertainty="
-                    f"{world_object['position_uncertainty_m']:.3f} m"
+                    f"uncertainty={world_object['position_uncertainty_m']:.3f} m"
                 )
 
             world_object_count = len(self.world_objects)
@@ -325,6 +372,8 @@ class CameraSub(Node):
         # Replace this every frame. It represents only the
         # objects visible in the current processed image.
         self.current_objects = frame_objects
+        self.publish_world_objects(depth_msg.header.stamp)
+        self.object_observations_pub.publish(obs_array_msg)
 
         # self.get_logger().info(f"Frame contains {len(frame_objects)} 3D objects; world map contains {world_object_count} objects")
         self.get_logger().info("Frame summary: "
@@ -788,20 +837,14 @@ class CameraSub(Node):
 
         self.mark_stale_world_objects(timestamp_ns)
         return assigned_ids
-
-    def get_active_world_objects_snapshot(self, query_timestamp_ns):
-        """Return a thread-safe, freshness-filtered snapshot for SST."""
+    
+    def get_world_objects_snapshot(self):
+        """
+        Return a thread-safe snapshot containing all saved world objects, including inactive objects.
+        """
         snapshot = {}
         with self.world_objects_lock:
             for world_object_id, world_object in self.world_objects.items():
-                relative_age = self.elapsed_seconds(world_object, query_timestamp_ns)
-                if relative_age < -self.sst_future_observation_tolerance_s:
-                    continue
-                age = max(0.0, relative_age)
-                maximum_age = self.dynamic_active_age_s if world_object["label"] in self.dynamic_labels else self.static_active_age_s
-                if age > maximum_age:
-                    continue
-
                 copied_object = world_object.copy()
                 copied_object["position_odom"] = world_object["position_odom"].copy()
                 copied_object["velocity_odom"] = world_object["velocity_odom"].copy()
@@ -809,6 +852,57 @@ class CameraSub(Node):
                 snapshot[world_object_id] = copied_object
 
         return snapshot
+
+    def publish_world_objects(self, stamp):
+        world_snapshot = self.get_world_objects_snapshot()
+        world_array_msg = WorldObjectArray()
+        world_array_msg.header.stamp = stamp
+        world_array_msg.header.frame_id = 'odom'
+
+        for world_object_id, stored_object in world_snapshot.items():
+            world_msg = WorldObject()
+            world_msg.world_object_id = int(world_object_id)
+            world_msg.label = str(stored_object['label'])
+            world_msg.label_confidence = float(stored_object['label_confidence'])
+
+            world_msg.position.x = float(stored_object['position_odom'][0])
+            world_msg.position.y = float(stored_object['position_odom'][1])
+            world_msg.position.z = float(stored_object['position_odom'][2])
+
+            world_msg.velocity.x = float(stored_object['velocity_odom'][0])
+            world_msg.velocity.y = float(stored_object['velocity_odom'][1])
+            world_msg.velocity.z = float(stored_object['velocity_odom'][2])
+
+            world_msg.radius_m = float(stored_object['radius_m'])
+            world_msg.position_uncertainty_m = float(stored_object['position_uncertainty_m'])
+            world_msg.first_seen.sec = int(stored_object['first_seen_ns'] // 1_000_000_000)
+            world_msg.first_seen.nanosec = int(stored_object['first_seen_ns'] % 1_000_000_000)
+            world_msg.last_seen.sec = int(stored_object['last_seen_ns'] // 1_000_000_000)
+            world_msg.last_seen.nanosec = int(stored_object['last_seen_ns'] % 1_000_000_000)
+            world_msg.active = bool(stored_object['active'])
+            world_msg.observation_count = int(stored_object['observation_count'])
+            world_msg.vision_track_ids = [int(vision_track_id) for vision_track_id in sorted(stored_object['vision_track_ids'])]
+
+            world_array_msg.objects.append(world_msg)
+
+        self.world_objects_pub.publish(world_array_msg)
+
+    def publish_empty_observation_frame(self, depth_msg, timestamp_ns):
+        self.current_objects = {}
+
+        # Update active/inactive state first.
+        with self.world_objects_lock:
+            self.prune_stale_track_mappings(timestamp_ns)
+            self.mark_stale_world_objects(timestamp_ns)
+
+        # The lock is released before taking the snapshot.
+        self.publish_world_objects(depth_msg.header.stamp)
+
+        empty_observations = VisualObservationArray()
+        empty_observations.header.stamp = depth_msg.header.stamp
+        empty_observations.header.frame_id = depth_msg.header.frame_id
+
+        self.object_observations_pub.publish(empty_observations)
 
 def main(args=None):
     rclpy.init(args=args)
