@@ -9,5 +9,7 @@ services:
         - ../package.xml:/ros2_ws/src/camera_pipeline/package.xml
         - ../setup.cfg:/ros2_ws/src/camera_pipeline/setup.cfg
         - ../setup.py:/ros2_ws/src/camera_pipeline/setup.py
+        - ../../phd_msgs:/ros2_ws/src/phd_msgs
+        - ../../odas_ros:/ros2_ws/src/odas_ros
       command: >
-        bash -c "source /opt/ros/humble/setup.bash && colcon build --packages-select camera_pipeline && source install/setup.bash && ros2 launch camera_pipeline camera_pipeline.launch.py"
+        bash -c "source /opt/ros/humble/setup.bash && colcon build --packages-select odas_ros_msgs phd_msgs camera_pipeline && source install/setup.bash && ros2 launch camera_pipeline camera_pipeline.launch.py"
